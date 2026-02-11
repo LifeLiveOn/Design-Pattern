@@ -22,9 +22,9 @@ Use ONLY the provided course context to answer.
 Always cite course ID and title in your answer.
 Only recommend courses that are in the provided context.
 Answer only questions related to academic courses.
-If the question is not related to academic courses, respond with:
+(IF) the question is not related to academic courses, respond with:
 "I can only answer questions related to academic courses."
-If no relevant courses are found, explicitly say:
+(IF) no relevant courses are found, explicitly say:
 "No relevant courses were found in the provided context."
 """
 
@@ -66,7 +66,8 @@ def load_documents(path: str) -> list[Document]:
                 docs.append(
                     Document(
                         page_content=desc.strip(),
-                        metadata={"id": str(cid).strip(), "title": str(title).strip()},
+                        metadata={"id": str(cid).strip(),
+                                  "title": str(title).strip()},
                     )
                 )
     return docs
@@ -85,7 +86,8 @@ def build_vectorstore(docs: list[Document]) -> Chroma:
             persist_directory=PERSIST_DIR,
         )
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500, chunk_overlap=100)
     chunks = splitter.split_documents(docs)
 
     return Chroma.from_documents(
@@ -117,10 +119,10 @@ def search_by_id(course_id: str) -> str:
 
 @tool
 def search_by_title(title: str) -> str:
-    """Look up a course by exact title match (case-insensitive)."""
+    """Look up a course by contain matching title in query."""
     title_norm = str(title).strip().lower()
     for course in COURSE_INDEX.values():
-        if str(course.get("title", "")).strip().lower() == title_norm:
+        if title_norm in str(course.get("title", "")).strip().lower():
             return (
                 f"Course ID: {course.get('id')}\n"
                 f"Title: {course.get('title')}\n"
