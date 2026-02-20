@@ -8,11 +8,11 @@ A lightweight Retrieval-Augmented Generation (RAG) demo that serves course infor
 - [uv](https://github.com/astral-sh/uv)
 - Ollama (Granite 4: 3B)
 
-
 ## Installation
 
 ```bash
 ollama run granite4:3b #download granite4:3b model
+ollama serve # start the ollama server to receive input
 cd Design-Pattern
 # Install dependencies with uv (creates .venv by default) need a uv.lock file
 uv sync
