@@ -1,25 +1,16 @@
-from __future__ import annotations
-
-import os
-import re
 import json
-import shutil
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 import gradio as gr
-from langchain_core.documents import Document
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Provider implementations (Ollama now; OpenAI/Gemini later)
-from langchain_ollama import OllamaEmbeddings, ChatOllama
 
-
-# =========================
-# CONFIG
-# =========================
 @dataclass(frozen=True)
 class RagConfig:
     file_path: str = "course-desc.jsonl"
@@ -28,366 +19,297 @@ class RagConfig:
     collection: str = "course_desc"
     base_url: str = "http://127.0.0.1:11434"
     model: str = "granite4:3b"
-    temperature: float = 0.4
+    temperature: float = 0.1
 
 
 SYSTEM = """You are an expert academic advisor.
-Use ONLY the provided course context to answer.
+Use provided context and tools to answer.
 Always cite course ID and title in your answer.
-Only recommend courses that are in the provided context.
+Only recommend courses that are in the provided context or returned by tools.
 Answer only questions related to academic courses.
-(IF) the question is not related to academic courses, respond with:
-"I can only answer questions related to academic courses."
-(IF) no relevant courses are found, explicitly say:
-"No relevant courses were found in the provided context."
+If no relevant courses are found, say:
+\"No relevant courses were found in the provided context.\"
 """
 
-
-# =========================
-# ABSTRACT FACTORY (3rd pattern)
-# =========================
-class LlmProviderFactory(Protocol):
-    def create_chat(self) -> Any: ...
-    def create_embeddings(self) -> Any: ...
+FALLBACK = "No relevant courses were found in the provided context."
 
 
-@dataclass(frozen=True)
-class OllamaFactory:
-    base_url: str
-    model: str
-    temperature: float = 0.4
+def format_course(course: dict[str, Any]) -> str:
+    return (
+        f"Course ID: {course.get('id')}\n"
+        f"Title: {course.get('title')}\n"
+        f"Description: {course.get('description')}"
+    )
 
-    def create_chat(self) -> Any:
-        return ChatOllama(
-            model=self.model,
-            temperature=self.temperature,
-            base_url=self.base_url,
+
+def format_docs(docs: Sequence[Document]) -> str:
+    lines = [f"Here are relevant courses found: {len(docs)} courses.\n"]
+    for d in docs:
+        lines.append(
+            f"- Course ID: {d.metadata.get('id', '?')} — {d.metadata.get('title', 'Untitled')}\n"
+            f"  Description: {d.page_content}"
         )
-
-    def create_embeddings(self) -> Any:
-        return OllamaEmbeddings(
-            model=self.model,
-            base_url=self.base_url,
-        )
+    return "\n".join(lines)
 
 
-# =========================
-# STRATEGY PATTERN
-# =========================
 class RetrievalStrategy(Protocol):
     def retrieve(self, query: str, k: int) -> Sequence[Document]: ...
 
 
 @dataclass(frozen=True)
-class ChromaTopKStrategy:
-    vectorstore: Any
+class TopNStrategy:
+    vs: Any
 
     def retrieve(self, query: str, k: int) -> Sequence[Document]:
-        return self.vectorstore.similarity_search(query, k=k)
+        return self.vs.similarity_search(query, k=k)
 
 
-# =========================
-# CHAIN OF RESPONSIBILITY
-# =========================
 @dataclass(frozen=True)
-class HandlerResult:
-    handled: bool
-    # final answer to show user (for ID/title/fallback)
-    answer: Optional[str] = None
-    # context for LLM generation (for semantic handler)
-    context: Optional[str] = None
-    # retrieved docs (for deterministic formatting)
-    docs: Optional[Sequence[Document]] = None
+class WindowStrategy:
+    vs: Any
+    chunks_by_course: dict[str, list[Document]]
+    radius: int = 1
+
+    def retrieve(self, query: str, k: int) -> Sequence[Document]:
+        anchors = list(self.vs.similarity_search(query, k=max(1, min(3, k))))
+        out: list[Document] = []
+        seen: set[tuple[str, int]] = set()
+        for anchor in anchors:
+            cid = str(anchor.metadata.get("id", "")).strip()
+            idx = int(anchor.metadata.get("chunk_index", 0))
+            chunks = self.chunks_by_course.get(cid, [])
+            for c in chunks[max(0, idx - self.radius): idx + self.radius + 1]:
+                key = (str(c.metadata.get("id", "")).strip(),
+                       int(c.metadata.get("chunk_index", 0)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(c)
+        return out[:k] or list(self.vs.similarity_search(query, k=k))
 
 
-class BaseHandler:
-    def __init__(self) -> None:
-        self._next: Optional["BaseHandler"] = None
+@dataclass(frozen=True)
+class DocumentStrategy:
+    vs: Any
 
-    def set_next(self, nxt: "BaseHandler") -> "BaseHandler":
-        self._next = nxt
-        return nxt
-
-    def _pass(self, query: str) -> HandlerResult:
-        if not self._next:
-            return HandlerResult(handled=True, answer="No relevant courses were found in the provided context.")
-        return self._next.handle(query)
-
-    def handle(self, query: str) -> HandlerResult:
-        return self._pass(query)
-
-
-@dataclass
-class CourseIdHandler(BaseHandler):
-    course_index: dict[str, dict]
-
-    def __post_init__(self) -> None:
-        super().__init__()
-
-    def handle(self, query: str) -> HandlerResult:
-        # Match standalone 4-digit IDs (e.g., "4361") and typical phrases.
-        m = re.search(r"\b(\d{4})\b", query)
-        if not m:
-            return self._pass(query)
-
-        cid = m.group(1)
-        course = self.course_index.get(cid)
-        if not course:
-            return HandlerResult(handled=True, answer=f"No course found with ID {cid}")
-
-        ans = (
-            f"Course ID: {cid}\n"
-            f"Title: {course.get('title')}\n"
-            f"Description: {course.get('description')}"
-        )
-        return HandlerResult(handled=True, answer=ans)
+    def retrieve(self, query: str, k: int) -> Sequence[Document]:
+        docs = list(self.vs.similarity_search(query, k=max(10, k * 4)))
+        out: list[Document] = []
+        seen_ids: set[str] = set()
+        for d in docs:
+            cid = str(d.metadata.get("id", "")).strip()
+            if not cid or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            out.append(d)
+            if len(out) >= k:
+                break
+        return out
 
 
-@dataclass
-class CourseTitleHandler(BaseHandler):
-    course_index: dict[str, dict]
+@dataclass(frozen=True)
+class HierarchicalStrategy:
+    vs: Any
 
-    def __post_init__(self) -> None:
-        super().__init__()
-
-    def handle(self, query: str) -> HandlerResult:
-        q = query.lower()
-
-        # Only trigger if user is probably asking by title.
-        # (You can tune this if your professor tests weird phrasing.)
-        title_trigger = any(kw in q for kw in [
-                            "title", "titled", "called", "named"])
-        has_quotes = ("'" in query) or ('"' in query)
-        if not (title_trigger or has_quotes):
-            return self._pass(query)
-
-        # Prefer quoted title if present
-        qm = re.search(r"['\"]([^'\"]+)['\"]", query)
-        needle = (qm.group(1) if qm else query).strip().lower()
-
-        for course in self.course_index.values():
-            title = str(course.get("title", "")).strip().lower()
-            if needle and needle in title:
-                ans = (
-                    f"Course ID: {course.get('id')}\n"
-                    f"Title: {course.get('title')}\n"
-                    f"Description: {course.get('description')}"
-                )
-                return HandlerResult(handled=True, answer=ans)
-
-        return HandlerResult(handled=True, answer=f"No course found with title '{needle}'")
+    def retrieve(self, query: str, k: int) -> Sequence[Document]:
+        coarse_ids = {
+            str(d.metadata.get("id", "")).strip()
+            for d in DocumentStrategy(self.vs).retrieve(query, max(2, k))
+        }
+        fine = list(self.vs.similarity_search(query, k=max(20, k * 6)))
+        ranked = [d for d in fine if str(d.metadata.get("id", "")).strip() in coarse_ids] + [
+            d for d in fine if str(d.metadata.get("id", "")).strip() not in coarse_ids
+        ]
+        out: list[Document] = []
+        seen: set[tuple[str, int]] = set()
+        for d in ranked:
+            key = (str(d.metadata.get("id", "")).strip(),
+                   int(d.metadata.get("chunk_index", 0)))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(d)
+            if len(out) >= k:
+                break
+        return out
 
 
-@dataclass
-class SemanticRagHandler(BaseHandler):
-    retrieval: RetrievalStrategy
-    k: int
-
-    def __post_init__(self) -> None:
-        super().__init__()
-
-    def handle(self, query: str) -> HandlerResult:
-        docs = list(self.retrieval.retrieve(query, self.k))
-        if not docs:
-            return self._pass(query)
-
-        context = "\n\n".join(
-            f"Course ID: {d.metadata.get('id')}\n"
-            f"Title: {d.metadata.get('title')}\n"
-            f"Description: {d.page_content}"
-            for d in docs
-        )
-        return HandlerResult(handled=True, context=context, docs=docs)
-
-
-class FallbackHandler(BaseHandler):
-    def handle(self, query: str) -> HandlerResult:
-        return HandlerResult(handled=True, answer="No relevant courses were found in the provided context.")
-
-
-# =========================
-# APP
-# =========================
 class RagApp:
-    def __init__(self, cfg: RagConfig, factory: LlmProviderFactory):
+    def __init__(self, cfg: RagConfig):
         self.cfg = cfg
+        self.llm = ChatOllama(
+            model=cfg.model, temperature=cfg.temperature, base_url=cfg.base_url)
+        self.emb = OllamaEmbeddings(model=cfg.model, base_url=cfg.base_url)
 
-        # Abstract Factory creates provider-specific implementations
-        self.embeddings = factory.create_embeddings()
-        self.llm = factory.create_chat()
+        self.course_index, docs = self._load_courses(cfg.file_path)
+        chunks = self._chunk_docs(docs)
+        self.chunks_by_course = self._group_by_course(chunks)
+        # check dir exists and has data, otherwise add to vector store
 
-        self.course_index = self._load_course_index(cfg.file_path)
-        docs = self._load_documents(cfg.file_path)
-        self.vectorstore = self._build_vectorstore(docs)
-
-        # Strategy
-        self.retrieval_strategy: RetrievalStrategy = ChromaTopKStrategy(
-            self.vectorstore)
-
-        # Chain of Responsibility
-        self.chain = self._build_chain()
-
-    def _build_chain(self) -> BaseHandler:
-        id_h = CourseIdHandler(self.course_index)
-        title_h = CourseTitleHandler(self.course_index)
-        sem_h = SemanticRagHandler(
-            self.retrieval_strategy, k=self.cfg.retrieve_k)
-        fb_h = FallbackHandler()
-
-        id_h.set_next(title_h).set_next(sem_h).set_next(fb_h)
-        return id_h
-
-    def _load_course_index(self, path: str) -> dict[str, dict]:
-        index: dict[str, dict] = {}
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                obj = json.loads(line)
-                cid = str(obj.get("id", "")).strip()
-                if cid:
-                    index[cid] = obj
-        return index
-
-    def _load_documents(self, path: str) -> list[Document]:
-        docs: list[Document] = []
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                obj = json.loads(line)
-                cid = obj.get("id")
-                desc = obj.get("description", "")
-                title = obj.get("title", "Untitled")
-
-                if cid and desc:
-                    docs.append(
-                        Document(
-                            page_content=str(desc).strip(),
-                            metadata={
-                                "id": str(cid).strip(),
-                                "title": str(title).strip(),
-                            },
-                        )
-                    )
-        return docs
-
-    def _vector_count(self, vectorstore: Chroma) -> int:
-        """Best-effort count of vectors; returns 0 on failure."""
-        try:
-            # type: ignore[attr-defined]
-            return vectorstore._collection.count()
-        except Exception:
-            return 0
-
-    def _build_vectorstore(self, docs: list[Document]) -> Chroma:
-        cfg = self.cfg
-        # Try loading an existing vector store first; if it fails, rebuild from documents.
-        if os.path.exists(cfg.persist_dir):
-            print("Loading existing vectorstore from disk...")
-            try:
-                vs = Chroma(
-                    embedding_function=self.embeddings,
-                    collection_name=cfg.collection,
-                    persist_directory=cfg.persist_dir,
-                )
-                if self._vector_count(vs) > 0:
-                    return vs
-                print("Existing vectorstore is empty; rebuilding...")
-                shutil.rmtree(cfg.persist_dir, ignore_errors=True)
-            except Exception as exc:
-                print(f"Failed to load vectorstore, rebuilding... ({exc})")
-
-        print("Creating vectorstore from documents...")
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500, chunk_overlap=100)
-        chunks = splitter.split_documents(docs)
-
-        return Chroma.from_documents(
+        self.vs = Chroma.from_documents(
             documents=chunks,
-            embedding_function=self.embeddings,
+            embedding=self.emb,
             collection_name=cfg.collection,
             persist_directory=cfg.persist_dir,
         )
 
-    def _format_docs_answer(self, docs: Sequence[Document]) -> str:
-        lines: list[str] = [
-            "Here are relevant courses from the provided context:"]
+        self.strategies: dict[str, RetrievalStrategy] = {
+            "Top N": TopNStrategy(self.vs),
+            "Window": WindowStrategy(self.vs, self.chunks_by_course),
+            "Document": DocumentStrategy(self.vs),
+            "Hierarchical": HierarchicalStrategy(self.vs),
+        }
+        self.current_strategy = "Top N"
+        self.tools = self._build_tools()
+        self.tool_map = {t.name: t for t in self.tools}
+
+    def _build_tools(self):
+        @tool
+        def get_course_by_id(course_id: str) -> str:
+            """Get exact course details by numeric course ID (e.g., 4361)."""
+            cid = str(course_id).strip()
+            course = self.course_index.get(cid)
+            return format_course(course) if course else f"No course found with ID {cid}"
+
+        @tool
+        def find_course_by_title(title: str) -> str:
+            """Find the first course whose title contains the provided text. or similar to the provided text.
+            ex: "design patterns" should match "software design patterns"
+            """
+            t = str(title).strip().lower()
+            if not t:
+                return "No title provided."
+            for course in self.course_index.values():
+                if t in str(course.get("title", "")).lower():
+                    return format_course(course)
+            return f"No course found with title '{title}'"
+
+        return [get_course_by_id, find_course_by_title]
+
+    def _retrieve_docs(self, query: str) -> Sequence[Document]:
+        """
+        Retrieve relevant course documents based on the current strategy.
+        """
+        docs = list(self.strategies[self.current_strategy].retrieve(
+            query, self.cfg.retrieve_k))
+        out: list[Document] = []
+        seen_ids: set[str] = set()
         for d in docs:
-            cid = d.metadata.get("id", "?")
-            title = d.metadata.get("title", "Untitled")
-            desc = d.page_content
-            lines.append(
-                f"- Course ID: {cid} — {title}\n  Description: {desc}")
-        return "\n".join(lines)
+            cid = str(d.metadata.get("id", "")).strip()
+            if not cid or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            out.append(d)
+        return out
 
-    def _generate_from_context(self, question: str, context: str) -> str:
-        messages: list = [SystemMessage(content=SYSTEM)]
+    def _load_courses(self, path: str) -> tuple[dict[str, dict[str, Any]], list[Document]]:
+        index: dict[str, dict[str, Any]] = {}
+        docs: list[Document] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                obj = json.loads(line)
+                cid = str(obj.get("id", "")).strip()
+                title = str(obj.get("title", "Untitled")).strip()
+                desc = str(obj.get("description", "")).strip()
+                if not cid:
+                    continue
+                index[cid] = {"id": cid, "title": title, "description": desc}
+                if desc:
+                    docs.append(Document(page_content=desc, metadata={
+                                "id": cid, "title": title}))
+        return index, docs
 
-        prompt = (
-            f"Course context:\n{context}\n\n"
-            f"Student question:\n{question}\n\n"
-            f"Instructions:\n"
-            f"- Use ONLY the course context.\n"
-            f"- Always cite course ID and title.\n"
-            f"- At least one course is provided in the context; do NOT answer with the fallback unless the context is empty.\n"
-            f"- If and only if the context is empty, say: "
-            f"\"No relevant courses were found in the provided context.\""
-        )
-        messages.append(HumanMessage(content=prompt))
+    def _chunk_docs(self, docs: list[Document]) -> list[Document]:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500, chunk_overlap=100)
+        out: list[Document] = []
+        for d in docs:
+            for i, text in enumerate(splitter.split_text(d.page_content)):
+                md = dict(d.metadata)
+                md["chunk_index"] = i
+                out.append(Document(page_content=text, metadata=md))
+        return out
 
-        ai = self.llm.invoke(messages)
-        raw = (ai.content or "").strip()
-        if not raw:
-            return "Model returned no answer."
-        if raw.lower().strip() == "no relevant courses were found in the provided context.":
-            return "Model returned fallback unexpectedly. Please try rephrasing."
-        return raw
+    def _group_by_course(self, chunks: list[Document]) -> dict[str, list[Document]]:
+        grouped: dict[str, list[Document]] = {}
+        for c in chunks:
+            grouped.setdefault(
+                str(c.metadata.get("id", "")).strip(), []).append(c)
+        for cid in grouped:
+            grouped[cid].sort(key=lambda d: int(
+                d.metadata.get("chunk_index", 0)))
+        return grouped
 
-    def answer(self, student_query: str, history=None) -> str:
-        q = str(student_query or "").strip()
-        if not q:
+    def _ask_llm(self, question: str, context: str) -> str:
+        llm_with_tools = self.llm.bind_tools(self.tools)
+        messages: list = [
+            SystemMessage(content=SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Course context:\n{context or '(none)'}\n\n"
+                    f"Student question:\n{question}\n\n"
+                    f"Use tools when user asks by ID or title."
+                )
+            ),
+        ]
+
+        ai = llm_with_tools.invoke(messages)
+        for _ in range(5):
+            tool_calls = getattr(ai, "tool_calls", [])
+            if not tool_calls:
+                break
+            messages.append(ai)
+            for call in tool_calls:
+                name = call.get("name")
+                args = call.get("args", {})
+                tool_fn = self.tool_map.get(name)
+                result = tool_fn.invoke(
+                    args) if tool_fn else f"Tool '{name}' not found"
+                messages.append(ToolMessage(content=str(
+                    result), tool_call_id=call.get("id")))
+            ai = llm_with_tools.invoke(messages)
+
+        return (ai.content or "").strip()
+
+    def answer(self, student_query: str, history=None, retrieval_mode: str = "Top N") -> str:
+        question = str(student_query or "").strip()
+        if not question:
             return "Ask a course-related question."
+        if retrieval_mode in self.strategies:
+            self.current_strategy = retrieval_mode
 
-        result = self.chain.handle(q)
-
-        # ID/title/fallback produce direct answers (no LLM rewrite needed)
-        if result.answer is not None:
-            return result.answer
-
-        # semantic handler returns context -> generate natural answer
-        if result.context is not None:
-            llm_answer = self._generate_from_context(q, result.context)
-            if (not llm_answer or llm_answer.lower().strip().startswith("model returned fallback")
-                    or llm_answer.lower().strip().startswith("no relevant courses were found")) and result.docs:
-                return self._format_docs_answer(result.docs)
-            return llm_answer
-
-        # should never happen
-        return "No relevant courses were found in the provided context."
+        docs = list(self._retrieve_docs(question))
+        context = "\n\n".join(
+            f"Course ID: {d.metadata.get('id')}\nTitle: {d.metadata.get('title')}\nDescription: {d.page_content}"
+            for d in docs
+        )
+        answer = self._ask_llm(question, context)
+        if not answer or answer.lower().startswith("no relevant courses were found"):
+            return format_docs(docs) if docs else FALLBACK
+        return answer
 
 
-def main():
-    cfg = RagConfig()
-
-    # Choose provider factory (Ollama now)
-    factory = OllamaFactory(base_url=cfg.base_url,
-                            model=cfg.model, temperature=cfg.temperature)
-
-    app = RagApp(cfg, factory)
-
+def main() -> None:
+    app = RagApp(RagConfig())
     with gr.Blocks() as demo:
-        gr.Markdown(
-            "## Academic Course Advisor (Strategy + CoR + Abstract Factory)")
-
+        gr.Markdown("## Academic Course Advisor (Strategy + Tool Calling)")
+        strategy = gr.Dropdown(
+            ["Top N", "Window", "Document", "Hierarchical"],
+            value="Top N",
+            label="Retrieval Strategy",
+        )
         gr.ChatInterface(
             fn=app.answer,
+            additional_inputs=[strategy],
             title="Chat Advisor",
             examples=[
-                "What are introductory machine learning courses?",
-                "Look up course ID 4361",
-                "Give me the course description for 4361",
-                "Can you find a course titled 'Data Mining'?",
-                "Which course teaches design patterns?",
+                ["What courses teach machine learning?", "Top N"],
+                ["Look up course ID 4361", "Document"],
+                ["Find a course titled Data Mining", "Window"],
+                ["Which course teaches materials for design patterns?", "Document"],
+                ["Can you recommend courses related to databases?", "Hierarchical"]
             ],
         )
-
     demo.launch()
 
 
