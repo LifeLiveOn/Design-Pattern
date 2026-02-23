@@ -5,16 +5,21 @@ A lightweight Retrieval-Augmented Generation (RAG) demo that serves course infor
 ## Requirements
 
 - Python 3.12+
-- [uv](https://github.com/astral-sh/uv)
+- [uv](https://github.com/astral-sh/uv) through powershell `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
 - Ollama (Granite 4: 3B)
 
 ## Installation
 
 ```bash
+
 ollama run granite4:3b #download granite4:3b model
 ollama serve # start the ollama server to receive input
+
+uv venv --python 3.12
+.venv\Scripts\activate
+
 cd Design-Pattern
-# Install dependencies with uv (creates .venv by default) need a uv.lock file
+# Install dependencies with uv (creates .venv by default) need a uv.lock file if have trouble just delete uv.lock and uv run asm1Rag.py
 uv sync
 ```
 
