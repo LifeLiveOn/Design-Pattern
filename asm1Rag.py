@@ -5,9 +5,7 @@ from typing import Any, Protocol, Sequence
 import gradio as gr
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
@@ -22,24 +20,7 @@ class RagConfig:
     temperature: float = 0.1
 
 
-SYSTEM = """You are an expert academic advisor.
-Use provided context and tools to answer.
-Always cite course ID and title in your answer.
-Only recommend courses that are in the provided context or returned by tools.
-Answer only questions related to academic courses.
-If no relevant courses are found, say:
-\"No relevant courses were found in the provided context.\"
-"""
-
 FALLBACK = "No relevant courses were found in the provided context."
-
-
-def format_course(course: dict[str, Any]) -> str:
-    return (
-        f"Course ID: {course.get('id')}\n"
-        f"Title: {course.get('title')}\n"
-        f"Description: {course.get('description')}"
-    )
 
 
 def format_docs(docs: Sequence[Document]) -> str:
@@ -137,8 +118,6 @@ class HierarchicalStrategy:
 class RagApp:
     def __init__(self, cfg: RagConfig):
         self.cfg = cfg
-        self.llm = ChatOllama(
-            model=cfg.model, temperature=cfg.temperature, base_url=cfg.base_url)
         self.emb = OllamaEmbeddings(model=cfg.model, base_url=cfg.base_url)
 
         self.course_index, docs = self._load_courses(cfg.file_path)
@@ -160,31 +139,6 @@ class RagApp:
             "Hierarchical": HierarchicalStrategy(self.vs),
         }
         self.current_strategy = "Top N"
-        self.tools = self._build_tools()
-        self.tool_map = {t.name: t for t in self.tools}
-
-    def _build_tools(self):
-        @tool
-        def get_course_by_id(course_id: str) -> str:
-            """Get exact course details by numeric course ID (e.g., 4361)."""
-            cid = str(course_id).strip()
-            course = self.course_index.get(cid)
-            return format_course(course) if course else f"No course found with ID {cid}"
-
-        @tool
-        def find_course_by_title(title: str) -> str:
-            """Find the first course whose title contains the provided text. or similar to the provided text.
-            ex: "design patterns" should match "software design patterns"
-            """
-            t = str(title).strip().lower()
-            if not t:
-                return "No title provided."
-            for course in self.course_index.values():
-                if t in str(course.get("title", "")).lower():
-                    return format_course(course)
-            return f"No course found with title '{title}'"
-
-        return [get_course_by_id, find_course_by_title]
 
     def _retrieve_docs(self, query: str) -> Sequence[Document]:
         """
@@ -240,37 +194,6 @@ class RagApp:
                 d.metadata.get("chunk_index", 0)))
         return grouped
 
-    def _ask_llm(self, question: str, context: str) -> str:
-        llm_with_tools = self.llm.bind_tools(self.tools)
-        messages: list = [
-            SystemMessage(content=SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Course context:\n{context or '(none)'}\n\n"
-                    f"Student question:\n{question}\n\n"
-                    f"Use tools when user asks by ID or title."
-                )
-            ),
-        ]
-
-        ai = llm_with_tools.invoke(messages)
-        for _ in range(5):
-            tool_calls = getattr(ai, "tool_calls", [])
-            if not tool_calls:
-                break
-            messages.append(ai)
-            for call in tool_calls:
-                name = call.get("name")
-                args = call.get("args", {})
-                tool_fn = self.tool_map.get(name)
-                result = tool_fn.invoke(
-                    args) if tool_fn else f"Tool '{name}' not found"
-                messages.append(ToolMessage(content=str(
-                    result), tool_call_id=call.get("id")))
-            ai = llm_with_tools.invoke(messages)
-
-        return (ai.content or "").strip()
-
     def answer(self, student_query: str, history=None, retrieval_mode: str = "Top N") -> str:
         question = str(student_query or "").strip()
         if not question:
@@ -279,14 +202,7 @@ class RagApp:
             self.current_strategy = retrieval_mode
 
         docs = list(self._retrieve_docs(question))
-        context = "\n\n".join(
-            f"Course ID: {d.metadata.get('id')}\nTitle: {d.metadata.get('title')}\nDescription: {d.page_content}"
-            for d in docs
-        )
-        answer = self._ask_llm(question, context)
-        if not answer or answer.lower().startswith("no relevant courses were found"):
-            return format_docs(docs) if docs else FALLBACK
-        return answer
+        return format_docs(docs) if docs else FALLBACK
 
 
 def main() -> None:
