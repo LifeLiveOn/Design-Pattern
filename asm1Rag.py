@@ -1,4 +1,5 @@
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 
@@ -16,11 +17,19 @@ class RagConfig:
     persist_dir: str = ".chroma_course_desc"
     collection: str = "course_desc"
     base_url: str = "http://127.0.0.1:11434"
-    model: str = "granite4:3b"
+    model: str = "nomic-embed-text"
     temperature: float = 0.1
 
 
 FALLBACK = "No relevant courses were found in the provided context."
+
+
+def format_course(course: dict[str, Any]) -> str:
+    return (
+        f"Course ID: {course.get('id')}\n"
+        f"Title: {course.get('title')}\n"
+        f"Description: {course.get('description')}"
+    )
 
 
 def format_docs(docs: Sequence[Document]) -> str:
@@ -194,12 +203,54 @@ class RagApp:
                 d.metadata.get("chunk_index", 0)))
         return grouped
 
+    def _extract_course_id(self, question: str) -> str | None:
+        match = re.search(
+            r"\bcourse\s*id\s*[:#-]?\s*(\d+)\b", question, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+        if question.isdigit():
+            return question
+        return None
+
+    def _extract_title(self, question: str) -> str | None:
+        patterns = [
+            r"\btitled\s+['\"]?([^'\"?.!,]+)['\"]?",
+            r"\btitle\s+['\"]?([^'\"?.!,]+)['\"]?",
+            r"\bcourse\s+['\"]?([^'\"?.!,]+)['\"]?",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, question, flags=re.IGNORECASE)
+            if match:
+                title = match.group(1).strip()
+                if title:
+                    return title
+        return None
+
+    def _lookup_by_title(self, title: str) -> dict[str, Any] | None:
+        lookup = title.strip().lower()
+        if not lookup:
+            return None
+        for course in self.course_index.values():
+            if lookup in str(course.get("title", "")).lower():
+                return course
+        return None
+
     def answer(self, student_query: str, history=None, retrieval_mode: str = "Top N") -> str:
         question = str(student_query or "").strip()
         if not question:
             return "Ask a course-related question."
         if retrieval_mode in self.strategies:
             self.current_strategy = retrieval_mode
+
+        course_id = self._extract_course_id(question)
+        if course_id:
+            course = self.course_index.get(course_id)
+            return format_course(course) if course else f"No course found with ID {course_id}"
+
+        title = self._extract_title(question)
+        if title:
+            course = self._lookup_by_title(title)
+            return format_course(course) if course else f"No course found with title '{title}'"
 
         docs = list(self._retrieve_docs(question))
         return format_docs(docs) if docs else FALLBACK
@@ -208,7 +259,8 @@ class RagApp:
 def main() -> None:
     app = RagApp(RagConfig())
     with gr.Blocks() as demo:
-        gr.Markdown("## Academic Course Advisor (Strategy + Tool Calling)")
+        gr.Markdown(
+            "## Academic Course Advisor no reasoning just fetch from vector store")
         strategy = gr.Dropdown(
             ["Top N", "Window", "Document", "Hierarchical"],
             value="Top N",

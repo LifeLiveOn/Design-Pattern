@@ -11,10 +11,12 @@ A lightweight Retrieval-Augmented Generation (RAG) demo that serves course infor
 ## Installation
 
 ```bash
-ollama run granite4:3b #download granite4:3b model
+
+ollama run granite4:3b #download granite4:3b model or nomic-embed-text
 ollama serve # start the ollama server to receive input
 cd Design-Pattern
 # Install dependencies with uv (creates .venv by default) need a uv.lock file
+uv venv --python 3.12
 uv sync
 ```
 
