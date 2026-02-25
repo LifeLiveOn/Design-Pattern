@@ -235,6 +235,24 @@ class RagApp:
                 return course
         return None
 
+    def _handle_course_id(self, question: str) -> str | None:
+        course_id = self._extract_course_id(question)
+        if not course_id:
+            return None
+        course = self.course_index.get(course_id)
+        return format_course(course) if course else None
+
+    def _handle_title(self, question: str) -> str | None:
+        title = self._extract_title(question)
+        if not title:
+            return None
+        course = self._lookup_by_title(title)
+        return format_course(course) if course else None
+
+    def _handle_retrieval(self, question: str) -> str | None:
+        docs = list(self._retrieve_docs(question))
+        return format_docs(docs) if docs else None
+
     def answer(self, student_query: str, history=None, retrieval_mode: str = "Top N") -> str:
         question = str(student_query or "").strip()
         if not question:
@@ -242,18 +260,18 @@ class RagApp:
         if retrieval_mode in self.strategies:
             self.current_strategy = retrieval_mode
 
-        course_id = self._extract_course_id(question)
-        if course_id:
-            course = self.course_index.get(course_id)
-            return format_course(course) if course else f"No course found with ID {course_id}"
+        handlers = [
+            self._handle_course_id,
+            self._handle_title,
+            self._handle_retrieval,
+        ]
 
-        title = self._extract_title(question)
-        if title:
-            course = self._lookup_by_title(title)
-            return format_course(course) if course else f"No course found with title '{title}'"
+        for handler in handlers:
+            result = handler(question)
+            if result:
+                return result
 
-        docs = list(self._retrieve_docs(question))
-        return format_docs(docs) if docs else FALLBACK
+        return FALLBACK
 
 
 def main() -> None:
