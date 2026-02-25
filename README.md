@@ -1,20 +1,19 @@
 # RAG Q&A Course Info
 
-A lightweight Retrieval-Augmented Generation (RAG) demo that serves course information via a Gradio chat interface. It uses ChromaDB for embeddings and cosine similarity, with an ID lookup path for special cases. Model is Granite (IBM) 4.0
+A lightweight Retrieval-Augmented Generation (RAG) demo that serves course information via a Gradio chat interface. It uses ChromaDB for embeddings and cosine similarity, with an ID lookup path for special cases. Model is nomic-embed-text
 
 ## Requirements
 
 - Python 3.12+
 - [uv](https://github.com/astral-sh/uv)
-- Ollama (Granite 4: 3B)
+- nomic-embed-text for embedding only
 
 ## Installation
 
 ```bash
 
-ollama run granite4:3b #download granite4:3b model or nomic-embed-text
+ollama run nomic-embed-text #download granite4:3b model or nomic-embed-text
 ollama serve # start the ollama server to receive input
-cd Design-Pattern
 # Install dependencies with uv (creates .venv by default) need a uv.lock file
 uv venv --python 3.12
 uv sync
